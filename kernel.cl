@@ -79,7 +79,7 @@ __kernel void winograd_2x2_3x3_32x32(
     __local float SM[8 * 16 * 32];
     __local float *pRSV = SM + ((tid & 0xf0) << 1) + (tid & 0x3);
     __local float *pRSU = SM + 4 * 16 * 32 + ((tid & 0xf0) << 1) + ((tid & 0xc) >> 2);
-    
+
     float r[8][8], rA[8], rB[8];
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 8; ++j) {
@@ -97,7 +97,7 @@ __kernel void winograd_2x2_3x3_32x32(
             }
         }
 
-        __global float *pV = inputs + (h * W + w) * N + n;
+        __global float *pV = inputs + ((ci * H + h) * W + w) * N + n;
         for (int i = 0; i < 4; ++i) {
             for (int j = 0; j < 4; ++j) {
                 v[i][j] = ci >= 0 && preds[i][j] ? pV[(i * W + j) * N] : 0;
@@ -183,7 +183,7 @@ __kernel void winograd_2x2_3x3_32x32(
 
         bool pred = k < K;
 
-        __global float *pU = filters + k;
+        __global float *pU = filters + ci * 3 * 3 * K + k;
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j) {
                 u[i][j] = ci >= 0 && pred ? pU[(i * 3 + j) * K] : 0;
@@ -202,10 +202,10 @@ __kernel void winograd_2x2_3x3_32x32(
             TU[3][1] = u[2][1];
             TU[3][2] = u[2][2];
             TU[1][0] = TA[0] + u[1][0] * 0.5;
-            TU[1][1] = TA[1] + u[1][1] * 0.5;
-            TU[1][2] = TA[2] + u[1][2] * 0.5;
             TU[2][0] = TA[0] - u[1][0] * 0.5;
+            TU[1][1] = TA[1] + u[1][1] * 0.5;
             TU[2][1] = TA[1] - u[1][1] * 0.5;
+            TU[1][2] = TA[2] + u[1][2] * 0.5;
             TU[2][2] = TA[2] - u[1][2] * 0.5;
             TB[0] = (TU[0][0] + TU[0][2]) * 0.5;
             TB[1] = (TU[1][0] + TU[1][2]) * 0.5;
@@ -283,14 +283,17 @@ __kernel void winograd_2x2_3x3_32x32(
                     pWSM[(i << 11) + (j << 2)] = r[l * 2 + i][j];
                 }
             }
-            barrier(CLK_LOCAL_MEM_FENCE);
-            float m[4][4], TM[4][2], M[2][2];
 
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            float m[4][4], TM[4][2], M[2][2];
             for (int i = 0; i < 4; ++i) {
                 for (int j = 0; j < 4; ++j) {
                     m[i][j] = pRSM[(i * 4 + j) * 32];
                 }
             }
+
+            barrier(CLK_LOCAL_MEM_FENCE);
 
             TM[0][0] = m[0][0] + m[0][1] + m[0][2];
             TM[0][1] = m[0][1] - m[0][2] - m[0][3];
