@@ -27,7 +27,7 @@ double timer_end(int id, const char *s) {
     struct timespec x, y;
     clock_gettime(CLOCK_MONOTONIC, &x);
     timespec_subtract(&y, &x, &t[id]);
-    double elapsed = y.tv_sec + y.tv_nsec / 1e9;
-    printf("[%s] %f sec\n", s, elapsed);
+    double elapsed = y.tv_sec * 1e3 + y.tv_nsec / 1e6;
+    printf("[%s] %f ms\n", s, elapsed);
     return elapsed;
 }

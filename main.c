@@ -146,7 +146,7 @@ void convolution_wino(float *inputs, float *outputs, float *filters, float *bias
     CHECK_ERROR(clEnqueueWriteBuffer(queue, inputs_dev, CL_TRUE, 0, sizeof(float) * (N * C * H * W), inputs, 0, NULL, NULL));
     CHECK_ERROR(clEnqueueWriteBuffer(queue, filters_dev, CL_TRUE, 0, sizeof(float) * (K * C * R * S), filters, 0, NULL, NULL));
     CHECK_ERROR(clEnqueueWriteBuffer(queue, bias_dev, CL_TRUE, 0, sizeof(float) * (K), bias, 0, NULL, NULL));
-    timer_end(0, "wino WriteBuffer");
+    //timer_end(0, "wino WriteBuffer");
 
     {
         timer_start(0);
@@ -160,7 +160,7 @@ void convolution_wino(float *inputs, float *outputs, float *filters, float *bias
         size_t lws[1] = {256};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
         clFinish(queue);
-        timer_end(0, "wino input transform");
+        //timer_end(0, "wino input transform");
     }
 
     {
@@ -175,7 +175,7 @@ void convolution_wino(float *inputs, float *outputs, float *filters, float *bias
         size_t lws[1] = {256};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
         clFinish(queue);
-        timer_end(0, "wino filter transform");
+        //timer_end(0, "wino filter transform");
     }
 
     {
@@ -221,7 +221,7 @@ void convolution_wino(float *inputs, float *outputs, float *filters, float *bias
         CHECK_ERROR(clSetKernelArg(kernel1, 21, sizeof(int), &TQshift));
         CHECK_ERROR(clSetKernelArg(kernel1, 22, sizeof(int), &Nmask));
         CHECK_ERROR(clSetKernelArg(kernel1, 23, sizeof(int), &Nwidth));
-        size_t gws[3] = {TP * TQ * BN * BK * 256, _ceil_div(TK, BK), _ceil_div(TN, BN)};
+        size_t gws[3] = {TP * TQ * BN * BK * 256, TK / BK, TN / BN};
         size_t lws[3] = {256, 1, 1};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel1, 3, NULL, gws, lws, 0, NULL, NULL));
         clFinish(queue);
@@ -240,12 +240,12 @@ void convolution_wino(float *inputs, float *outputs, float *filters, float *bias
         size_t lws[1] = {256};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel2, 1, NULL, gws, lws, 0, NULL, NULL));
         clFinish(queue);
-        timer_end(0, "wino output transform");
+        //timer_end(0, "wino output transform");
     }
 
     timer_start(0);
     CHECK_ERROR(clEnqueueReadBuffer(queue, outputs_dev, CL_TRUE, 0, sizeof(float) * (N * K * P * Q), outputs, 0, NULL, NULL));
-    timer_end(0, "wino ReadBuffer");
+    //timer_end(0, "wino ReadBuffer");
 
     clReleaseMemObject(inputs_dev);
     clReleaseMemObject(inputs_CHWN_dev);
@@ -277,7 +277,7 @@ void convolution_current(float *inputs, float *outputs, float *filters, float *b
     CHECK_ERROR(clEnqueueWriteBuffer(queue, inputs_dev, CL_TRUE, 0, sizeof(float) * (N * C * H * W), inputs, 0, NULL, NULL));
     CHECK_ERROR(clEnqueueWriteBuffer(queue, filters_dev, CL_TRUE, 0, sizeof(float) * (K * C * R * S), filters, 0, NULL, NULL));
     CHECK_ERROR(clEnqueueWriteBuffer(queue, bias_dev, CL_TRUE, 0, sizeof(float) * (K), bias, 0, NULL, NULL));
-    timer_end(0, "current WriteBuffer");
+    //timer_end(0, "current WriteBuffer");
 
     {
         timer_start(0);
@@ -304,7 +304,7 @@ void convolution_current(float *inputs, float *outputs, float *filters, float *b
 
     timer_start(0);
     CHECK_ERROR(clEnqueueReadBuffer(queue, outputs_dev, CL_TRUE, 0, sizeof(float) * (N * K * P * Q), outputs, 0, NULL, NULL));
-    timer_end(0, "current ReadBuffer");
+    //timer_end(0, "current ReadBuffer");
 
     clReleaseMemObject(inputs_dev);
     clReleaseMemObject(outputs_dev);
@@ -328,14 +328,17 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
     float *outputs_cpu = (float*)malloc(sizeof(float) * (N * K * P * Q));
     float *outputs_wino = (float*)malloc(sizeof(float) * (N * K * P * Q));
     float *outputs_current = (float*)malloc(sizeof(float) * (N * K * P * Q));
-    convolution_cpu(inputs, outputs_cpu, filters, bias, N, C, H, W, K, P, Q, R, S, pad);
-    convolution_wino(inputs, outputs_wino, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
-    convolution_current(inputs, outputs_current, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+    //convolution_cpu(inputs, outputs_cpu, filters, bias, N, C, H, W, K, P, Q, R, S, pad);
+    for (int i = 0; i < 4; ++i) {
+        convolution_current(inputs, outputs_current, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        convolution_wino(inputs, outputs_wino, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+    }
     //printData(outputs_cpu, N, K, P, Q, "outputs_cpu");
     //printData(outputs_wino, N, K, P, Q, "outputs_wino");
     //printData(outputs_current, N, K, P, Q, "outputs_current");
-    printf("!!!!! WINO VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_wino, N, K, P, Q) ? "SUCCESS" : "FAIL");
-    printf("!!!!! CURRENT VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    //printf("!!!!! WINO VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_wino, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    //printf("!!!!! CURRENT VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    printf("!!!!! WINO == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
 
     free(inputs);
     free(filters);

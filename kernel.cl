@@ -166,11 +166,11 @@ __kernel void winograd_2x2_3x3_32x32(
                 }
             }
 
+            barrier(CLK_LOCAL_MEM_FENCE);
+
             ci += 4;
             if (ci >= C) break;
             pV += 4 * H * W * N;
-
-            barrier(CLK_LOCAL_MEM_FENCE);
 
             for (int i = 0; i < 4; ++i) {
                 for (int j = 0; j < 4; ++j) {
@@ -248,11 +248,11 @@ __kernel void winograd_2x2_3x3_32x32(
                 }
             }
 
+            barrier(CLK_LOCAL_MEM_FENCE);
+
             ci += 4;
             if (ci >= C) break;
             pU += 4 * 3 * 3 * K;
-
-            barrier(CLK_LOCAL_MEM_FENCE);
 
             for (int i = 0; i < 3; ++i) {
                 for (int j = 0; j < 3; ++j) {
@@ -321,3 +321,53 @@ __kernel void winograd_2x2_3x3_32x32(
         }
     }
 }
+
+typedef float NNType;
+__kernel void CCF(
+        __global NNType * inputs,
+        __global NNType * outputs,
+        __global NNType * filters,
+        __global NNType * bias,
+        uint width,
+        uint height,
+        uint depth,
+        uint prev_width,
+        uint prev_height,
+        uint prev_depth,
+        uint filter_width,
+        uint filter_height,
+        uint padding_size,
+        uint stride)
+{
+    uint j = get_global_id(0) % width;
+    uint i = get_global_id(0) / width;
+    uint a = get_global_id(1);
+    uint batch_id = get_global_id(2);
+    __global NNType * input = inputs + batch_id * prev_depth * prev_width * prev_height;
+    __global NNType * output = outputs + batch_id * depth * width * height;
+    uint from_i = i * stride;
+    uint from_j = j * stride;
+    //for(uint a = 0; a < depth; a++)
+    {
+        NNType sum = 0;
+        for(uint b = 0; b < prev_depth; b++)
+        {
+            for(uint fi = 0; fi < filter_height; fi++)
+            {
+                for(uint fj = 0; fj < filter_width; fj++)
+                {
+                    int iin = -padding_size + from_i + fi;
+                    int jin = -padding_size + from_j + fj;
+                    NNType x = (iin >= 0 && iin < prev_height && jin >= 0 && jin < prev_width)
+                        ? input[b * prev_width * prev_height + iin * prev_width + jin]
+                        : 0;
+                    NNType f = filters[ (a * prev_depth + b) * (filter_height * filter_width) + fi * filter_width + fj ];
+                    sum += x * f;
+                }
+            }
+        }
+        sum += bias[a];
+        output[a * width * height + i * width + j] = sum;
+    }
+}
+
