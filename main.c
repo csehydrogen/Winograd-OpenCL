@@ -32,13 +32,13 @@ cl_program create_and_build_program(cl_context context, cl_device_id device, con
     free(source_code);
 
     err = clBuildProgram(program, 1, &device, "", NULL, NULL);
-    if (err == CL_BUILD_PROGRAM_FAILURE) {
+    {
         size_t log_size;
         CHECK_ERROR(clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size));
         char *log = (char*)malloc(log_size + 1);
         CHECK_ERROR(clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log, NULL));
         log[log_size] = 0;
-        printf("Compile error:\n%s\n", log);
+        printf("Build log :\n%s\n", log);
         free(log);
     }
     CHECK_ERROR(err);
@@ -119,7 +119,239 @@ void convolution_cpu(float *inputs, float *outputs, float *filters, float *bias,
     timer_end(0, "cpu Convolution");
 }
 
-void convolution_wino(float *inputs, float *outputs, float *filters, float *bias, int N, int C, int H, int W, int K, int P, int Q, int R, int S, int pad, cl_context context, cl_command_queue queue, cl_program program) {
+#define CONV_BK 16
+#define CONV_BKH 8
+#define CONV_BIJ 64
+#define CONV_LXY 16
+#define CONV_RXY 4
+
+void convolution_mc(float *inputs, float *outputs, float *filters, float *bias, int N, int C, int H, int W, int K, int P, int Q, int R, int S, int pad, cl_context context, cl_command_queue queue, cl_program program) {
+    cl_kernel kernel0 = clCreateKernel(program, "conv_preA", &err);
+    CHECK_ERROR(err);
+    cl_kernel kernel1 = clCreateKernel(program, "conv_postC", &err);
+    CHECK_ERROR(err);
+    cl_kernel kernel2 = clCreateKernel(program, "conv", &err);
+    CHECK_ERROR(err);
+
+    int IU = K, KU = C * 9, JU = H * W;
+    int IA = _ceil(IU, CONV_BIJ), KA = _ceil(KU, CONV_BK), JA = _ceil(JU, CONV_BIJ);
+    int KK = KA / CONV_BK;
+
+    cl_mem filters_pre_dev = clCreateBuffer(context, 0, sizeof(float) * (K * C * R * S), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem filters_dev = clCreateBuffer(context, 0, sizeof(float) * (KA * IA), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem inputs_dev = clCreateBuffer(context, 0, sizeof(float) * (N * C * H * W), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outputs_dev = clCreateBuffer(context, 0, sizeof(float) * (IA * JA), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outputs_post_dev = clCreateBuffer(context, 0, sizeof(float) * (N * K * P * Q), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem bias_dev = clCreateBuffer(context, 0, sizeof(float) * (K), NULL, &err);
+    CHECK_ERROR(err);
+
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, inputs_dev, CL_TRUE, 0, sizeof(float) * (N * C * H * W), inputs, 0, NULL, NULL));
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, filters_pre_dev, CL_TRUE, 0, sizeof(float) * (K * C * R * S), filters, 0, NULL, NULL));
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, bias_dev, CL_TRUE, 0, sizeof(float) * (K), bias, 0, NULL, NULL));
+
+    {
+        CHECK_ERROR(clSetKernelArg(kernel0, 0, sizeof(cl_mem), &filters_pre_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 1, sizeof(cl_mem), &filters_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 2, sizeof(int), &KU));
+        CHECK_ERROR(clSetKernelArg(kernel0, 3, sizeof(int), &IA));
+        CHECK_ERROR(clSetKernelArg(kernel0, 4, sizeof(int), &KA));
+        size_t gws[] = {IA * KA};
+        size_t lws[] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+    }
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel2, 0, sizeof(cl_mem), &filters_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 1, sizeof(cl_mem), &inputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 2, sizeof(cl_mem), &outputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 3, sizeof(cl_mem), &bias_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 4, sizeof(int), &KK));
+        CHECK_ERROR(clSetKernelArg(kernel2, 5, sizeof(int), &IA));
+        CHECK_ERROR(clSetKernelArg(kernel2, 6, sizeof(int), &JA));
+        CHECK_ERROR(clSetKernelArg(kernel2, 7, sizeof(int), &KA));
+        CHECK_ERROR(clSetKernelArg(kernel2, 8, sizeof(int), &C));
+        CHECK_ERROR(clSetKernelArg(kernel2, 9, sizeof(int), &H)); // assume H == W
+        size_t gws[] = {JA / CONV_RXY, IA / CONV_RXY, N};
+        size_t lws[] = {CONV_LXY, CONV_LXY, 1};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel2, 3, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        timer_end(0, "mc");
+    }
+
+    {
+        CHECK_ERROR(clSetKernelArg(kernel1, 0, sizeof(cl_mem), &outputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 1, sizeof(cl_mem), &outputs_post_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 2, sizeof(int), &IA));
+        CHECK_ERROR(clSetKernelArg(kernel1, 3, sizeof(int), &JA));
+        CHECK_ERROR(clSetKernelArg(kernel1, 4, sizeof(int), &IU));
+        CHECK_ERROR(clSetKernelArg(kernel1, 5, sizeof(int), &JU));
+        size_t gws[] = {JA, IA, N};
+        size_t lws[] = {CONV_BIJ, 256 / CONV_BIJ, 1};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel1, 3, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+    }
+
+    CHECK_ERROR(clEnqueueReadBuffer(queue, outputs_post_dev, CL_TRUE, 0, sizeof(float) * (N * K * P * Q), outputs, 0, NULL, NULL));
+
+    clReleaseMemObject(inputs_dev);
+    clReleaseMemObject(outputs_dev);
+    clReleaseMemObject(outputs_post_dev);
+    clReleaseMemObject(filters_dev);
+    clReleaseMemObject(filters_pre_dev);
+    clReleaseMemObject(bias_dev);
+
+    clReleaseKernel(kernel0);
+    clReleaseKernel(kernel1);
+    clReleaseKernel(kernel2);
+}
+
+void convolution_wino16(float *inputs, float *outputs, float *filters, float *bias, int N, int C, int H, int W, int K, int P, int Q, int R, int S, int pad, cl_context context, cl_command_queue queue, cl_program program) {
+    cl_kernel kernel0 = clCreateKernel(program, "NCHW2CHWN", &err);
+    CHECK_ERROR(err);
+    cl_kernel kernel1 = clCreateKernel(program, "winograd_2x2_3x3_16x16", &err);
+    CHECK_ERROR(err);
+    cl_kernel kernel2 = clCreateKernel(program, "CHWN2NCHW", &err);
+    CHECK_ERROR(err);
+
+    cl_mem inputs_dev = clCreateBuffer(context, 0, sizeof(float) * (N * C * H * W), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem inputs_CHWN_dev = clCreateBuffer(context, 0, sizeof(float) * (N * C * H * W), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outputs_dev = clCreateBuffer(context, 0, sizeof(float) * (N * K * P * Q), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outputs_CHWN_dev = clCreateBuffer(context, 0, sizeof(float) * (N * K * P * Q), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem filters_dev = clCreateBuffer(context, 0, sizeof(float) * (K * C * R * S), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem filters_CHWN_dev = clCreateBuffer(context, 0, sizeof(float) * (K * C * R * S), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem bias_dev = clCreateBuffer(context, 0, sizeof(float) * (K), NULL, &err);
+    CHECK_ERROR(err);
+
+    timer_start(0);
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, inputs_dev, CL_TRUE, 0, sizeof(float) * (N * C * H * W), inputs, 0, NULL, NULL));
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, filters_dev, CL_TRUE, 0, sizeof(float) * (K * C * R * S), filters, 0, NULL, NULL));
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, bias_dev, CL_TRUE, 0, sizeof(float) * (K), bias, 0, NULL, NULL));
+    //timer_end(0, "wino WriteBuffer");
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel0, 0, sizeof(cl_mem), &inputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 1, sizeof(cl_mem), &inputs_CHWN_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 2, sizeof(int), &N));
+        CHECK_ERROR(clSetKernelArg(kernel0, 3, sizeof(int), &C));
+        CHECK_ERROR(clSetKernelArg(kernel0, 4, sizeof(int), &H));
+        CHECK_ERROR(clSetKernelArg(kernel0, 5, sizeof(int), &W));
+        size_t gws[1] = {_ceil(N * C * H * W, 256)};
+        size_t lws[1] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        //timer_end(0, "wino input transform");
+    }
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel0, 0, sizeof(cl_mem), &filters_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 1, sizeof(cl_mem), &filters_CHWN_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 2, sizeof(int), &K));
+        CHECK_ERROR(clSetKernelArg(kernel0, 3, sizeof(int), &C));
+        CHECK_ERROR(clSetKernelArg(kernel0, 4, sizeof(int), &R));
+        CHECK_ERROR(clSetKernelArg(kernel0, 5, sizeof(int), &S));
+        size_t gws[1] = {_ceil(K * C * R * S, 256)};
+        size_t lws[1] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        //timer_end(0, "wino filter transform");
+    }
+
+    {
+        timer_start(0);
+        int BN = 1, BK = 1;
+        int TPmask, TPwidth, TPshift, TQmask, TQwidth, TQshift, Nmask, Nwidth;
+        if (N < 2)
+            TPmask = 0x0c, TPwidth = 2, TPshift = 2, TQmask = 0x03, TQwidth = 2, TQshift = 0, Nmask = 0x00, Nwidth = 0;
+        else if (N < 4)
+            TPmask = 0x08, TPwidth = 1, TPshift = 3, TQmask = 0x06, TQwidth = 2, TQshift = 1, Nmask = 0x01, Nwidth = 1;
+        else if (N < 8)
+            TPmask = 0x08, TPwidth = 1, TPshift = 3, TQmask = 0x04, TQwidth = 1, TQshift = 2, Nmask = 0x03, Nwidth = 2;
+        else if (N < 16)
+            TPmask = 0x00, TPwidth = 0, TPshift = 0, TQmask = 0x08, TQwidth = 1, TQshift = 3, Nmask = 0x07, Nwidth = 3;
+        else
+            TPmask = 0x00, TPwidth = 0, TPshift = 0, TQmask = 0x00, TQwidth = 0, TQshift = 0, Nmask = 0x0f, Nwidth = 4;
+        int TP = _ceil_div(P, 2 << TPwidth), TQ = _ceil_div(Q, 2 << TQwidth);
+        int TK = _ceil_div(K, 16), TN = _ceil_div(N, 1 << Nwidth);
+
+        CHECK_ERROR(clSetKernelArg(kernel1, 0, sizeof(cl_mem), &inputs_CHWN_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 1, sizeof(cl_mem), &outputs_CHWN_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 2, sizeof(cl_mem), &filters_CHWN_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 3, sizeof(cl_mem), &bias_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 4, sizeof(int), &N));
+        CHECK_ERROR(clSetKernelArg(kernel1, 5, sizeof(int), &C));
+        CHECK_ERROR(clSetKernelArg(kernel1, 6, sizeof(int), &H));
+        CHECK_ERROR(clSetKernelArg(kernel1, 7, sizeof(int), &W));
+        CHECK_ERROR(clSetKernelArg(kernel1, 8, sizeof(int), &K));
+        CHECK_ERROR(clSetKernelArg(kernel1, 9, sizeof(int), &P));
+        CHECK_ERROR(clSetKernelArg(kernel1, 10, sizeof(int), &Q));
+        CHECK_ERROR(clSetKernelArg(kernel1, 11, sizeof(int), &pad));
+        CHECK_ERROR(clSetKernelArg(kernel1, 12, sizeof(int), &TP));
+        CHECK_ERROR(clSetKernelArg(kernel1, 13, sizeof(int), &TQ));
+        CHECK_ERROR(clSetKernelArg(kernel1, 14, sizeof(int), &BN));
+        CHECK_ERROR(clSetKernelArg(kernel1, 15, sizeof(int), &BK));
+        CHECK_ERROR(clSetKernelArg(kernel1, 16, sizeof(int), &TPmask));
+        CHECK_ERROR(clSetKernelArg(kernel1, 17, sizeof(int), &TPwidth));
+        CHECK_ERROR(clSetKernelArg(kernel1, 18, sizeof(int), &TPshift));
+        CHECK_ERROR(clSetKernelArg(kernel1, 19, sizeof(int), &TQmask));
+        CHECK_ERROR(clSetKernelArg(kernel1, 20, sizeof(int), &TQwidth));
+        CHECK_ERROR(clSetKernelArg(kernel1, 21, sizeof(int), &TQshift));
+        CHECK_ERROR(clSetKernelArg(kernel1, 22, sizeof(int), &Nmask));
+        CHECK_ERROR(clSetKernelArg(kernel1, 23, sizeof(int), &Nwidth));
+        size_t gws[3] = {TP * TQ * BN * BK * 256, TK / BK, TN / BN};
+        size_t lws[3] = {256, 1, 1};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel1, 3, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        timer_end(0, "wino16");
+    }
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel2, 0, sizeof(cl_mem), &outputs_CHWN_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 1, sizeof(cl_mem), &outputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 2, sizeof(int), &N));
+        CHECK_ERROR(clSetKernelArg(kernel2, 3, sizeof(int), &K));
+        CHECK_ERROR(clSetKernelArg(kernel2, 4, sizeof(int), &P));
+        CHECK_ERROR(clSetKernelArg(kernel2, 5, sizeof(int), &Q));
+        size_t gws[1] = {_ceil(N * K * P * Q, 256)};
+        size_t lws[1] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel2, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        //timer_end(0, "wino output transform");
+    }
+
+    timer_start(0);
+    CHECK_ERROR(clEnqueueReadBuffer(queue, outputs_dev, CL_TRUE, 0, sizeof(float) * (N * K * P * Q), outputs, 0, NULL, NULL));
+    //timer_end(0, "wino ReadBuffer");
+
+    clReleaseMemObject(inputs_dev);
+    clReleaseMemObject(inputs_CHWN_dev);
+    clReleaseMemObject(outputs_dev);
+    clReleaseMemObject(outputs_CHWN_dev);
+    clReleaseMemObject(filters_dev);
+    clReleaseMemObject(filters_CHWN_dev);
+    clReleaseMemObject(bias_dev);
+
+    clReleaseKernel(kernel0);
+    clReleaseKernel(kernel1);
+    clReleaseKernel(kernel2);
+}
+
+void convolution_wino32(float *inputs, float *outputs, float *filters, float *bias, int N, int C, int H, int W, int K, int P, int Q, int R, int S, int pad, cl_context context, cl_command_queue queue, cl_program program) {
     cl_kernel kernel0 = clCreateKernel(program, "NCHW2CHWN", &err);
     CHECK_ERROR(err);
     cl_kernel kernel1 = clCreateKernel(program, "winograd_2x2_3x3_32x32", &err);
@@ -326,26 +558,34 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
     //printData(bias, 1, 1, 1, K, "bias");
 
     float *outputs_cpu = (float*)malloc(sizeof(float) * (N * K * P * Q));
-    float *outputs_wino = (float*)malloc(sizeof(float) * (N * K * P * Q));
+    float *outputs_wino32 = (float*)malloc(sizeof(float) * (N * K * P * Q));
+    float *outputs_wino16 = (float*)malloc(sizeof(float) * (N * K * P * Q));
     float *outputs_current = (float*)malloc(sizeof(float) * (N * K * P * Q));
+    float *outputs_mc = (float*)malloc(sizeof(float) * (N * K * P * Q));
     //convolution_cpu(inputs, outputs_cpu, filters, bias, N, C, H, W, K, P, Q, R, S, pad);
     for (int i = 0; i < 4; ++i) {
         convolution_current(inputs, outputs_current, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
-        convolution_wino(inputs, outputs_wino, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        convolution_wino32(inputs, outputs_wino32, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        convolution_wino16(inputs, outputs_wino16, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        convolution_mc(inputs, outputs_mc, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
     }
     //printData(outputs_cpu, N, K, P, Q, "outputs_cpu");
     //printData(outputs_wino, N, K, P, Q, "outputs_wino");
     //printData(outputs_current, N, K, P, Q, "outputs_current");
     //printf("!!!!! WINO VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_wino, N, K, P, Q) ? "SUCCESS" : "FAIL");
     //printf("!!!!! CURRENT VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
-    printf("!!!!! WINO == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    printf("!!!!! WINO32 == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino32, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    printf("!!!!! WINO16 == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino16, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    printf("!!!!! MC == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_mc, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
 
     free(inputs);
     free(filters);
     free(bias);
     free(outputs_cpu);
-    free(outputs_wino);
+    free(outputs_wino32);
+    free(outputs_wino16);
     free(outputs_current);
+    free(outputs_mc);
 }
 
 int main() {
@@ -376,7 +616,7 @@ int main() {
     //validate(33, 63, 17, 17, 63, 17, 17, 3, 3, 1, context, queue, program);
     //validate(1, 3, 224, 224, 64, 224, 224, 3, 3, 1, context, queue, program);
     //validate(1, 256, 56, 56, 256, 56, 56, 3, 3, 1, context, queue, program);
-    //validate(1, 512, 28, 28, 512, 28, 28, 3, 3, 1, context, queue, program);
+    validate(1, 512, 28, 28, 512, 28, 28, 3, 3, 1, context, queue, program);
 
     clReleaseProgram(program);
     clReleaseCommandQueue(queue);
