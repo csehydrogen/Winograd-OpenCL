@@ -4,7 +4,7 @@
 #include <math.h>
 #include <time.h>
 #include "timer.h"
-//#include <clBLAS.h>
+#include <clBLAS.h>
 
 #define CHECK_ERROR(err) \
     if (err != CL_SUCCESS) { \
@@ -83,7 +83,7 @@ int equalData(float *d0, float *d1, int N, int C, int H, int W) {
             for (int h = 0; h < H; ++h) {
                 for (int w = 0; w < W; ++w) {
                     int x = ((n * C + c) * H + h) * W + w;
-                    if ((d0[x] + d1[x] != 0 && fabs(d0[x] - d1[x]) / (d0[x] + d1[x]) > 1e-4) 
+                    if ((d0[x] + d1[x] != 0 && fabs((d0[x] - d1[x]) / (d0[x] + d1[x])) > 1e-4) 
                             || (d0[x] + d1[x] == 0 && d0[x] != 0)) {
                         printf("d0 = %f, d1 = %f\n", d0[x], d1[x]);
                         return 0;
@@ -576,6 +576,8 @@ void convolution_wino_nonfused(float *inputs, float *outputs, float *filters, fl
     CHECK_ERROR(clEnqueueWriteBuffer(queue, filters_dev, CL_TRUE, 0, sizeof(float) * (K * C * R * S), filters, 0, NULL, NULL));
     CHECK_ERROR(clEnqueueWriteBuffer(queue, bias_dev, CL_TRUE, 0, sizeof(float) * (K), bias, 0, NULL, NULL));
 
+    timer_start(1);
+
     {
         timer_start(0);
         CHECK_ERROR(clSetKernelArg(kernel0, 0, sizeof(cl_mem), &inputs_dev));
@@ -590,8 +592,8 @@ void convolution_wino_nonfused(float *inputs, float *outputs, float *filters, fl
         size_t gws[1] = {_ceil(N * C * TP * TQ, 256)};
         size_t lws[1] = {256};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
-        clFinish(queue);
-        timer_end(0, "wino_nonfused data_transform");
+        //clFinish(queue);
+        //timer_end(0, "wino_nonfused data_transform");
     }
 
     {
@@ -603,12 +605,11 @@ void convolution_wino_nonfused(float *inputs, float *outputs, float *filters, fl
         size_t gws[1] = {_ceil(K * C, 256)};
         size_t lws[1] = {256};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel1, 1, NULL, gws, lws, 0, NULL, NULL));
-        clFinish(queue);
-        timer_end(0, "wino_nonfused filter_transform");
+        //clFinish(queue);
+        //timer_end(0, "wino_nonfused filter_transform");
     }
 
     {
-        /*
         for (int i = 0; i < 16; ++i) {
             timer_start(0);
             cl_event event;
@@ -617,10 +618,9 @@ void convolution_wino_nonfused(float *inputs, float *outputs, float *filters, fl
                 filters_T_dev, i * K * C, C, inputs_T_dev, i * C * N * TP * TQ, N * TP * TQ,
                 0, outputs_T_dev, i * K * N * TP * TQ, N * TP * TQ,
                 1, &queue, 0, NULL, &event);
-            CHECK_ERROR(clWaitForEvents(1, &event));
-            timer_end(0, "wino_nonfused GEMM");
+            //CHECK_ERROR(clWaitForEvents(1, &event));
+            //timer_end(0, "wino_nonfused GEMM");
         }
-        */
     }
 
     {
@@ -637,9 +637,12 @@ void convolution_wino_nonfused(float *inputs, float *outputs, float *filters, fl
         size_t gws[1] = {_ceil(K * N * TP * TQ, 256)};
         size_t lws[1] = {256};
         CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel2, 1, NULL, gws, lws, 0, NULL, NULL));
-        clFinish(queue);
-        timer_end(0, "wino_nonfused inverse_transform");
+        //clFinish(queue);
+        //timer_end(0, "wino_nonfused inverse_transform");
     }
+
+    clFinish(queue);
+    timer_end(1, "wino_nonfused");
 
     CHECK_ERROR(clEnqueueReadBuffer(queue, outputs_dev, CL_TRUE, 0, sizeof(float) * (N * K * P * Q), outputs, 0, NULL, NULL));
 
@@ -678,8 +681,8 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
         convolution_current(inputs, outputs_current, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
         convolution_wino32(inputs, outputs_wino32, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
         convolution_wino16(inputs, outputs_wino16, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
-        convolution_mc(inputs, outputs_mc, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
-        convolution_wino_nonfused(inputs, outputs_mc, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        //convolution_mc(inputs, outputs_mc, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        convolution_wino_nonfused(inputs, outputs_wino_nonfused, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
     }
     //printData(outputs_cpu, N, K, P, Q, "outputs_cpu");
     //printData(outputs_wino, N, K, P, Q, "outputs_wino");
@@ -688,7 +691,7 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
     //printf("!!!!! CURRENT VALIDATION %s !!!!!\n", equalData(outputs_cpu, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
     printf("!!!!! WINO32 == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino32, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
     printf("!!!!! WINO16 == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino16, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
-    printf("!!!!! MC == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_mc, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    //printf("!!!!! MC == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_mc, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
     printf("!!!!! WINO_NONFUSED == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino_nonfused, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
 
     free(inputs);
@@ -721,7 +724,7 @@ int main() {
     queue = clCreateCommandQueue(context, device, 0, &err);
     CHECK_ERROR(err);
 
-    //CHECK_ERROR(clblasSetup());
+    CHECK_ERROR(clblasSetup());
 
     cl_program program = create_and_build_program(context, device, "kernel.cl");
 
@@ -734,7 +737,7 @@ int main() {
     validate(1, 256, 56, 56, 256, 56, 56, 3, 3, 1, context, queue, program);
     //validate(1, 512, 28, 28, 512, 28, 28, 3, 3, 1, context, queue, program);
 
-    //clblasTeardown();
+    clblasTeardown();
 
     clReleaseProgram(program);
     clReleaseCommandQueue(queue);
