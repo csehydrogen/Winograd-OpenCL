@@ -797,3 +797,201 @@ __kernel void conv(__global float *A, __global float *B, __global float *C, __gl
     C[JA * 3 + 3] = max(accum[15] + D[3], 0.0f);
 }
 
+/*
+ * inputs dim = (N, C, H, W)
+ * outputs dim = (16, C, N, TP, TQ)
+ * global_work_size = {_ceil(N * C * TP * TQ, 256)}
+ * local_work_size = {256}
+ */
+__kernel void winograd_2x2_3x3_data_transform(
+    __global float *inputs,
+    __global float *outputs,
+    int N, int C, int H, int W,
+    int pad,
+    int TP, int TQ
+    ) {
+    int nctptq = get_global_id(0);
+    int n = nctptq / (C * TP * TQ);
+    if (n >= N) return;
+    int ctptq = nctptq - n * (C * TP * TQ);
+    int c = ctptq / (TP * TQ);
+    int tptq = ctptq - c * (TP * TQ);
+    int tp = tptq / (TQ);
+    int tq = tptq - tp * (TQ);
+    int h = tp * 2 - pad, w = tq * 2 - pad;
+    float v[4][4], TV[4][4], V[4][4];
+
+    inputs += ((n * C + c) * H + h) * W + w;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            v[i][j] = 0 <= h + i && h + i < H && 0 <= w + j && w + j < W ? inputs[i * W + j] : 0;
+        }
+    }
+
+    TV[0][0] = v[0][0] - v[2][0];
+    TV[0][1] = v[0][1] - v[2][1];
+    TV[0][2] = v[0][2] - v[2][2];
+    TV[0][3] = v[0][3] - v[2][3];
+    TV[1][0] = v[1][0] + v[2][0];
+    TV[1][1] = v[1][1] + v[2][1];
+    TV[1][2] = v[1][2] + v[2][2];
+    TV[1][3] = v[1][3] + v[2][3];
+    TV[2][0] = v[2][0] - v[1][0];
+    TV[2][1] = v[2][1] - v[1][1];
+    TV[2][2] = v[2][2] - v[1][2];
+    TV[2][3] = v[2][3] - v[1][3];
+    TV[3][0] = v[1][0] - v[3][0];
+    TV[3][1] = v[1][1] - v[3][1];
+    TV[3][2] = v[1][2] - v[3][2];
+    TV[3][3] = v[1][3] - v[3][3];
+
+    V[0][0] = TV[0][0] - TV[0][2];
+    V[0][1] = TV[0][1] + TV[0][2];
+    V[0][2] = TV[0][2] - TV[0][1];
+    V[0][3] = TV[0][1] - TV[0][3];
+    V[1][0] = TV[1][0] - TV[1][2];
+    V[1][1] = TV[1][1] + TV[1][2];
+    V[1][2] = TV[1][2] - TV[1][1];
+    V[1][3] = TV[1][1] - TV[1][3];
+    V[2][0] = TV[2][0] - TV[2][2];
+    V[2][1] = TV[2][1] + TV[2][2];
+    V[2][2] = TV[2][2] - TV[2][1];
+    V[2][3] = TV[2][1] - TV[2][3];
+    V[3][0] = TV[3][0] - TV[3][2];
+    V[3][1] = TV[3][1] + TV[3][2];
+    V[3][2] = TV[3][2] - TV[3][1];
+    V[3][3] = TV[3][1] - TV[3][3];
+
+    outputs += ((c * N + n) * TP + tp) * TQ + tq;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            outputs[0] = V[i][j];
+            outputs += C * N * TP * TQ;
+        }
+    }
+}
+
+/*
+ * inputs dim = (K, C, 3, 3)
+ * outputs dim = (16, K, C)
+ * global_work_size = {_ceil(K * C, 256)}
+ * local_work_size = {256}
+ */
+__kernel void winograd_2x2_3x3_filter_transform(
+    __global float *inputs,
+    __global float *outputs,
+    int K, int C
+    ) {
+    int kc = get_global_id(0);
+    int k = kc / (C);
+    if (k >= K) return;
+    int c = kc - k * (C);
+    float u[3][3], TU[4][3], TA[3], TB[4], U[4][4];
+
+    inputs += (k * C + c) * 3 * 3;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            u[i][j] = inputs[i * 3 + j];
+        }
+    }
+
+    TA[0] = (u[0][0] + u[2][0]) * 0.5;
+    TA[1] = (u[0][1] + u[2][1]) * 0.5;
+    TA[2] = (u[0][2] + u[2][2]) * 0.5;
+    TU[0][0] = u[0][0];
+    TU[0][1] = u[0][1];
+    TU[0][2] = u[0][2];
+    TU[3][0] = u[2][0];
+    TU[3][1] = u[2][1];
+    TU[3][2] = u[2][2];
+    TU[1][0] = TA[0] + u[1][0] * 0.5;
+    TU[2][0] = TA[0] - u[1][0] * 0.5;
+    TU[1][1] = TA[1] + u[1][1] * 0.5;
+    TU[2][1] = TA[1] - u[1][1] * 0.5;
+    TU[1][2] = TA[2] + u[1][2] * 0.5;
+    TU[2][2] = TA[2] - u[1][2] * 0.5;
+    TB[0] = (TU[0][0] + TU[0][2]) * 0.5;
+    TB[1] = (TU[1][0] + TU[1][2]) * 0.5;
+    TB[2] = (TU[2][0] + TU[2][2]) * 0.5;
+    TB[3] = (TU[3][0] + TU[3][2]) * 0.5;
+    U[0][0] = TU[0][0];
+    U[0][3] = TU[0][2];
+    U[1][0] = TU[1][0];
+    U[1][3] = TU[1][2];
+    U[2][0] = TU[2][0];
+    U[2][3] = TU[2][2];
+    U[3][0] = TU[3][0];
+    U[3][3] = TU[3][2];
+    U[0][1] = TB[0] + TU[0][1] * 0.5;
+    U[0][2] = TB[0] - TU[0][1] * 0.5;
+    U[1][1] = TB[1] + TU[1][1] * 0.5;
+    U[1][2] = TB[1] - TU[1][1] * 0.5;
+    U[2][1] = TB[2] + TU[2][1] * 0.5;
+    U[2][2] = TB[2] - TU[2][1] * 0.5;
+    U[3][1] = TB[3] + TU[3][1] * 0.5;
+    U[3][2] = TB[3] - TU[3][1] * 0.5;
+
+    outputs += k * C + c;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            outputs[0] = U[i][j];
+            outputs += K * C;
+        }
+    }
+}
+
+/*
+ * inputs dim = (16, K, N, TP, TQ)
+ * outputs dim = (N, K, P, Q)
+ * global_work_size = {_ceil(K * N * TP * TQ, 256)}
+ * local_work_size = {256}
+ */
+__kernel void winograd_2x2_3x3_inverse_transform(
+    __global float *inputs,
+    __global float *outputs,
+    __global float *bias,
+    int N, int K, int P, int Q,
+    int TP, int TQ
+    ) {
+    int kntptq = get_global_id(0);
+    int k = kntptq / (N * TP * TQ);
+    if (k >= K) return;
+    int ntptq = kntptq - k * (N * TP * TQ);
+    int n = ntptq / (TP * TQ);
+    int tptq = ntptq - n * (TP * TQ);
+    int tp = tptq / (TQ);
+    int tq = tptq - tp * (TQ);
+    int p = tp * 2, q = tq * 2;
+    float m[4][4], TM[4][2], M[2][2];
+
+    inputs += ((k * N + n) * TP + tp) * TQ + tq;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            m[i][j] = inputs[0];
+            inputs += K * N * TP * TQ;
+        }
+    }
+
+    TM[0][0] = m[0][0] + m[0][1] + m[0][2];
+    TM[0][1] = m[0][1] - m[0][2] - m[0][3];
+    TM[1][0] = m[1][0] + m[1][1] + m[1][2];
+    TM[1][1] = m[1][1] - m[1][2] - m[1][3];
+    TM[2][0] = m[2][0] + m[2][1] + m[2][2];
+    TM[2][1] = m[2][1] - m[2][2] - m[2][3];
+    TM[3][0] = m[3][0] + m[3][1] + m[3][2];
+    TM[3][1] = m[3][1] - m[3][2] - m[3][3];
+
+    M[0][0] = TM[0][0] + TM[1][0] + TM[2][0];
+    M[0][1] = TM[0][1] + TM[1][1] + TM[2][1];
+    M[1][0] = TM[1][0] - TM[2][0] - TM[3][0];
+    M[1][1] = TM[1][1] - TM[2][1] - TM[3][1];
+
+    outputs += ((n * K + k) * P + p) * Q + q;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            if (p + i < P && q + j < Q) {
+                outputs[i * Q + j] = M[i][j] + bias[k];
+            }
+        }
+    }
+}

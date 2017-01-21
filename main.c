@@ -4,6 +4,7 @@
 #include <math.h>
 #include <time.h>
 #include "timer.h"
+//#include <clBLAS.h>
 
 #define CHECK_ERROR(err) \
     if (err != CL_SUCCESS) { \
@@ -546,6 +547,115 @@ void convolution_current(float *inputs, float *outputs, float *filters, float *b
     clReleaseKernel(kernel);
 }
 
+void convolution_wino_nonfused(float *inputs, float *outputs, float *filters, float *bias, int N, int C, int H, int W, int K, int P, int Q, int R, int S, int pad, cl_context context, cl_command_queue queue, cl_program program) {
+    cl_kernel kernel0 = clCreateKernel(program, "winograd_2x2_3x3_data_transform", &err);
+    CHECK_ERROR(err);
+    cl_kernel kernel1 = clCreateKernel(program, "winograd_2x2_3x3_filter_transform", &err);
+    CHECK_ERROR(err);
+    cl_kernel kernel2 = clCreateKernel(program, "winograd_2x2_3x3_inverse_transform", &err);
+    CHECK_ERROR(err);
+
+    int TP = _ceil_div(P, 2), TQ = _ceil_div(Q, 2);
+
+    cl_mem inputs_dev = clCreateBuffer(context, 0, sizeof(float) * (N * C * H * W), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem inputs_T_dev = clCreateBuffer(context, 0, sizeof(float) * (16 * C * N * TP * TQ), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem filters_dev = clCreateBuffer(context, 0, sizeof(float) * (K * C * R * S), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem filters_T_dev = clCreateBuffer(context, 0, sizeof(float) * (16 * K * C), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outputs_dev = clCreateBuffer(context, 0, sizeof(float) * (N * K * P * Q), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem outputs_T_dev = clCreateBuffer(context, 0, sizeof(float) * (16 * K * N * TP * TQ), NULL, &err);
+    CHECK_ERROR(err);
+    cl_mem bias_dev = clCreateBuffer(context, 0, sizeof(float) * (K), NULL, &err);
+    CHECK_ERROR(err);
+
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, inputs_dev, CL_TRUE, 0, sizeof(float) * (N * C * H * W), inputs, 0, NULL, NULL));
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, filters_dev, CL_TRUE, 0, sizeof(float) * (K * C * R * S), filters, 0, NULL, NULL));
+    CHECK_ERROR(clEnqueueWriteBuffer(queue, bias_dev, CL_TRUE, 0, sizeof(float) * (K), bias, 0, NULL, NULL));
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel0, 0, sizeof(cl_mem), &inputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 1, sizeof(cl_mem), &inputs_T_dev));
+        CHECK_ERROR(clSetKernelArg(kernel0, 2, sizeof(int), &N));
+        CHECK_ERROR(clSetKernelArg(kernel0, 3, sizeof(int), &C));
+        CHECK_ERROR(clSetKernelArg(kernel0, 4, sizeof(int), &H));
+        CHECK_ERROR(clSetKernelArg(kernel0, 5, sizeof(int), &W));
+        CHECK_ERROR(clSetKernelArg(kernel0, 6, sizeof(int), &pad));
+        CHECK_ERROR(clSetKernelArg(kernel0, 7, sizeof(int), &TP));
+        CHECK_ERROR(clSetKernelArg(kernel0, 8, sizeof(int), &TQ));
+        size_t gws[1] = {_ceil(N * C * TP * TQ, 256)};
+        size_t lws[1] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel0, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        timer_end(0, "wino_nonfused data_transform");
+    }
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel1, 0, sizeof(cl_mem), &filters_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 1, sizeof(cl_mem), &filters_T_dev));
+        CHECK_ERROR(clSetKernelArg(kernel1, 2, sizeof(int), &K));
+        CHECK_ERROR(clSetKernelArg(kernel1, 3, sizeof(int), &C));
+        size_t gws[1] = {_ceil(K * C, 256)};
+        size_t lws[1] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel1, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        timer_end(0, "wino_nonfused filter_transform");
+    }
+
+    {
+        /*
+        for (int i = 0; i < 16; ++i) {
+            timer_start(0);
+            cl_event event;
+            err = clblasSgemm(clblasRowMajor, clblasNoTrans, clblasNoTrans,
+                K, N * TP * TQ, C, 1,
+                filters_T_dev, i * K * C, C, inputs_T_dev, i * C * N * TP * TQ, N * TP * TQ,
+                0, outputs_T_dev, i * K * N * TP * TQ, N * TP * TQ,
+                1, &queue, 0, NULL, &event);
+            CHECK_ERROR(clWaitForEvents(1, &event));
+            timer_end(0, "wino_nonfused GEMM");
+        }
+        */
+    }
+
+    {
+        timer_start(0);
+        CHECK_ERROR(clSetKernelArg(kernel2, 0, sizeof(cl_mem), &outputs_T_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 1, sizeof(cl_mem), &outputs_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 2, sizeof(cl_mem), &bias_dev));
+        CHECK_ERROR(clSetKernelArg(kernel2, 3, sizeof(int), &N));
+        CHECK_ERROR(clSetKernelArg(kernel2, 4, sizeof(int), &K));
+        CHECK_ERROR(clSetKernelArg(kernel2, 5, sizeof(int), &P));
+        CHECK_ERROR(clSetKernelArg(kernel2, 6, sizeof(int), &Q));
+        CHECK_ERROR(clSetKernelArg(kernel2, 7, sizeof(int), &TP));
+        CHECK_ERROR(clSetKernelArg(kernel2, 8, sizeof(int), &TQ));
+        size_t gws[1] = {_ceil(K * N * TP * TQ, 256)};
+        size_t lws[1] = {256};
+        CHECK_ERROR(clEnqueueNDRangeKernel(queue, kernel2, 1, NULL, gws, lws, 0, NULL, NULL));
+        clFinish(queue);
+        timer_end(0, "wino_nonfused inverse_transform");
+    }
+
+    CHECK_ERROR(clEnqueueReadBuffer(queue, outputs_dev, CL_TRUE, 0, sizeof(float) * (N * K * P * Q), outputs, 0, NULL, NULL));
+
+    clReleaseMemObject(inputs_dev);
+    clReleaseMemObject(inputs_T_dev);
+    clReleaseMemObject(outputs_dev);
+    clReleaseMemObject(outputs_T_dev);
+    clReleaseMemObject(filters_dev);
+    clReleaseMemObject(filters_T_dev);
+    clReleaseMemObject(bias_dev);
+
+    clReleaseKernel(kernel0);
+    clReleaseKernel(kernel1);
+    clReleaseKernel(kernel2);
+}
+
 void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int pad, cl_context context, cl_command_queue queue, cl_program program) {
     float *inputs = (float*)malloc(sizeof(float) * (N * C * H * W));
     float *filters = (float*)malloc(sizeof(float) * (K * C * R * S));
@@ -562,12 +672,14 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
     float *outputs_wino16 = (float*)malloc(sizeof(float) * (N * K * P * Q));
     float *outputs_current = (float*)malloc(sizeof(float) * (N * K * P * Q));
     float *outputs_mc = (float*)malloc(sizeof(float) * (N * K * P * Q));
+    float *outputs_wino_nonfused = (float*)malloc(sizeof(float) * (N * K * P * Q));
     //convolution_cpu(inputs, outputs_cpu, filters, bias, N, C, H, W, K, P, Q, R, S, pad);
     for (int i = 0; i < 4; ++i) {
         convolution_current(inputs, outputs_current, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
         convolution_wino32(inputs, outputs_wino32, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
         convolution_wino16(inputs, outputs_wino16, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
         convolution_mc(inputs, outputs_mc, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
+        convolution_wino_nonfused(inputs, outputs_mc, filters, bias, N, C, H, W, K, P, Q, R, S, pad, context, queue, program);
     }
     //printData(outputs_cpu, N, K, P, Q, "outputs_cpu");
     //printData(outputs_wino, N, K, P, Q, "outputs_wino");
@@ -577,6 +689,7 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
     printf("!!!!! WINO32 == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino32, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
     printf("!!!!! WINO16 == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino16, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
     printf("!!!!! MC == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_mc, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
+    printf("!!!!! WINO_NONFUSED == CURRENT VALIDATION %s !!!!!\n", equalData(outputs_wino_nonfused, outputs_current, N, K, P, Q) ? "SUCCESS" : "FAIL");
 
     free(inputs);
     free(filters);
@@ -586,6 +699,7 @@ void validate(int N, int C, int H, int W, int K, int P, int Q, int R, int S, int
     free(outputs_wino16);
     free(outputs_current);
     free(outputs_mc);
+    free(outputs_wino_nonfused);
 }
 
 int main() {
@@ -607,6 +721,8 @@ int main() {
     queue = clCreateCommandQueue(context, device, 0, &err);
     CHECK_ERROR(err);
 
+    //CHECK_ERROR(clblasSetup());
+
     cl_program program = create_and_build_program(context, device, "kernel.cl");
 
     //validate(1, 1, 4, 4, 1, 2, 2, 3, 3, 0, context, queue, program);
@@ -615,8 +731,10 @@ int main() {
     //validate(1, 1, 15, 15, 1, 13, 13, 3, 3, 0, context, queue, program);
     //validate(33, 63, 17, 17, 63, 17, 17, 3, 3, 1, context, queue, program);
     //validate(1, 3, 224, 224, 64, 224, 224, 3, 3, 1, context, queue, program);
-    //validate(1, 256, 56, 56, 256, 56, 56, 3, 3, 1, context, queue, program);
-    validate(1, 512, 28, 28, 512, 28, 28, 3, 3, 1, context, queue, program);
+    validate(1, 256, 56, 56, 256, 56, 56, 3, 3, 1, context, queue, program);
+    //validate(1, 512, 28, 28, 512, 28, 28, 3, 3, 1, context, queue, program);
+
+    //clblasTeardown();
 
     clReleaseProgram(program);
     clReleaseCommandQueue(queue);
