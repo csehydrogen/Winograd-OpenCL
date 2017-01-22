@@ -949,7 +949,6 @@ __kernel void winograd_2x2_3x3_filter_transform(
 __kernel void winograd_2x2_3x3_inverse_transform(
     __global float *inputs,
     __global float *outputs,
-    __global float *bias,
     int N, int K, int P, int Q,
     int TP, int TQ
     ) {
@@ -990,8 +989,233 @@ __kernel void winograd_2x2_3x3_inverse_transform(
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             if (p + i < P && q + j < Q) {
-                outputs[i * Q + j] = M[i][j] + bias[k];
+                outputs[i * Q + j] = M[i][j];
             }
+        }
+    }
+}
+
+/*
+ * inputs dim = (K, C, R, S)
+ * outputs dim = (C, K, R, S) (reverse in R and S)
+ * global_work_size = {_ceil(K * C * R * S, 256)}
+ * local_work_size = {256}
+ */
+__kernel void flip_filter(
+    __global float *inputs,
+    __global float *outputs,
+    int K, int C, int R, int S
+    ) {
+    int kcrs = get_global_id(0);
+    int k = kcrs / (C * R * S);
+    if (k >= K) return;
+    int crs = kcrs - k * (C * R * S);
+    int c = crs / (R * S);
+    int rs = crs - c * (R * S);
+    int r = rs / (S);
+    int s = rs - r * (S);
+
+    outputs[((c * K + k) * R + (R - r - 1)) * S + (S - s - 1)] = inputs[kcrs];
+}
+
+/*
+ * inputs dim = (N, C, H, W)
+ * outputs dim = (16, C, N, TP, TQ)
+ * global_work_size = {_ceil(N * C * TP * TQ, 256)}
+ * local_work_size = {256}
+ */
+__kernel void winograd_3x3_2x2_data_transform(
+    __global float *inputs,
+    __global float *outputs,
+    int N, int C, int H, int W,
+    int pad,
+    int TP, int TQ
+    ) {
+    int nctptq = get_global_id(0);
+    int n = nctptq / (C * TP * TQ);
+    if (n >= N) return;
+    int ctptq = nctptq - n * (C * TP * TQ);
+    int c = ctptq / (TP * TQ);
+    int tptq = ctptq - c * (TP * TQ);
+    int tp = tptq / (TQ);
+    int tq = tptq - tp * (TQ);
+    int h = tp * 2 - pad, w = tq * 2 - pad;
+    float v[4][4], TV[4][4], V[4][4];
+
+    inputs += ((n * C + c) * H + h) * W + w;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            v[i][j] = 0 <= h + i && h + i < H && 0 <= w + j && w + j < W ? inputs[i * W + j] : 0;
+        }
+    }
+
+    TV[0][0] = v[0][0] - v[2][0];
+    TV[0][1] = v[0][1] - v[2][1];
+    TV[0][2] = v[0][2] - v[2][2];
+    TV[0][3] = v[0][3] - v[2][3];
+    TV[1][0] = v[1][0] + v[2][0];
+    TV[1][1] = v[1][1] + v[2][1];
+    TV[1][2] = v[1][2] + v[2][2];
+    TV[1][3] = v[1][3] + v[2][3];
+    TV[2][0] = v[2][0] - v[1][0];
+    TV[2][1] = v[2][1] - v[1][1];
+    TV[2][2] = v[2][2] - v[1][2];
+    TV[2][3] = v[2][3] - v[1][3];
+    TV[3][0] = v[3][0] - v[1][0];
+    TV[3][1] = v[3][1] - v[1][1];
+    TV[3][2] = v[3][2] - v[1][2];
+    TV[3][3] = v[3][3] - v[1][3];
+
+    V[0][0] = TV[0][0] - TV[0][2];
+    V[1][0] = TV[1][0] - TV[1][2];
+    V[2][0] = TV[2][0] - TV[2][2];
+    V[3][0] = TV[3][0] - TV[3][2];
+    V[0][1] = TV[0][1] + TV[0][2];
+    V[1][1] = TV[1][1] + TV[1][2];
+    V[2][1] = TV[2][1] + TV[2][2];
+    V[3][1] = TV[3][1] + TV[3][2];
+    V[0][2] = TV[0][2] - TV[0][1];
+    V[1][2] = TV[1][2] - TV[1][1];
+    V[2][2] = TV[2][2] - TV[2][1];
+    V[3][2] = TV[3][2] - TV[3][1];
+    V[0][3] = TV[0][3] - TV[0][1];
+    V[1][3] = TV[1][3] - TV[1][1];
+    V[2][3] = TV[2][3] - TV[2][1];
+    V[3][3] = TV[3][3] - TV[3][1];
+
+    outputs += ((c * N + n) * TP + tp) * TQ + tq;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            outputs[0] = V[i][j];
+            outputs += C * N * TP * TQ;
+        }
+    }
+}
+
+/*
+ * inputs dim = (N, K, P, Q)
+ * outputs dim = (16, K, N, TP, TQ)
+ * global_work_size = {_ceil(N * K * TP * TQ, 256)}
+ * local_work_size = {256}
+ */
+__kernel void winograd_3x3_2x2_filter_transform(
+    __global float *inputs,
+    __global float *outputs,
+    int N, int K, int P, int Q,
+    int TP, int TQ
+    ) {
+    int nktptq = get_global_id(0);
+    int n = nktptq / (K * TP * TQ);
+    if (n >= N) return;
+    int ktptq = nktptq - n * (K * TP * TQ);
+    int k = ktptq / (TP * TQ);
+    int tptq = ktptq - k * (TP * TQ);
+    int tp = tptq / (TQ);
+    int tq = tptq - tp * (TQ);
+    int p = tp * 2, q = tq * 2;
+    float u0[2][2], u1[4][2], u2[4][4];
+
+    inputs += ((n * K + k) * P + p) * Q + q;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            u0[i][j] = 0 <= p + i && p + i < P && 0 <= q + j && q + j < Q ? inputs[i * Q + j] : 0;
+        }
+    }
+
+    u1[0][0] = u0[0][0];
+    u1[0][1] = u0[0][1];
+    u1[1][0] = (u0[0][0] + u0[1][0]) * 0.5;
+    u1[1][1] = (u0[0][1] + u0[1][1]) * 0.5;
+    u1[2][0] = (u0[0][0] - u0[1][0]) * 0.5;
+    u1[2][1] = (u0[0][1] - u0[1][1]) * 0.5;
+    u1[3][0] = u0[1][0];
+    u1[3][1] = u0[1][1];
+
+    u2[0][0] = u1[0][0];
+    u2[1][0] = u1[1][0];
+    u2[2][0] = u1[2][0];
+    u2[3][0] = u1[3][0];
+    u2[0][1] = (u1[0][0] + u1[0][1]) * 0.5;
+    u2[1][1] = (u1[1][0] + u1[1][1]) * 0.5;
+    u2[2][1] = (u1[2][0] + u1[2][1]) * 0.5;
+    u2[3][1] = (u1[3][0] + u1[3][1]) * 0.5;
+    u2[0][2] = (u1[0][0] - u1[0][1]) * 0.5;
+    u2[1][2] = (u1[1][0] - u1[1][1]) * 0.5;
+    u2[2][2] = (u1[2][0] - u1[2][1]) * 0.5;
+    u2[3][2] = (u1[3][0] - u1[3][1]) * 0.5;
+    u2[0][3] = u1[0][1];
+    u2[1][3] = u1[1][1];
+    u2[2][3] = u1[2][1];
+    u2[3][3] = u1[3][1];
+
+    outputs += ((k * N + n) * TP + tp) * TQ + tq;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            outputs[0] = u2[i][j];
+            outputs += K * N * TP * TQ;
+        }
+    }
+}
+
+/*
+ * inputs dim = (16, K, C)
+ * outputs dim = (K, C, 3, 3)
+ * global_work_size = {_ceil(K * C, 256)}
+ * local_work_size = {256}
+ */
+__kernel void winograd_3x3_2x2_inverse_transform(
+    __global float *inputs,
+    __global float *outputs,
+    int K, int C
+    ) {
+    int kc = get_global_id(0);
+    int k = kc / (C);
+    if (k >= K) return;
+    int c = kc - k * (C);
+    float m0[4][4], m1[3][4], m2[3][3], mt[4];
+
+    inputs += k * C + c;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            m0[i][j] = inputs[0];
+            inputs += K * C;
+        }
+    }
+
+    mt[0] = m0[1][0] + m0[2][0];
+    mt[1] = m0[1][1] + m0[2][1];
+    mt[2] = m0[1][2] + m0[2][2];
+    mt[3] = m0[1][3] + m0[2][3];
+    m1[0][0] = mt[0] + m0[0][0];
+    m1[0][1] = mt[1] + m0[0][1];
+    m1[0][2] = mt[2] + m0[0][2];
+    m1[0][3] = mt[3] + m0[0][3];
+    m1[1][0] = m0[1][0] - m0[2][0];
+    m1[1][1] = m0[1][1] - m0[2][1];
+    m1[1][2] = m0[1][2] - m0[2][2];
+    m1[1][3] = m0[1][3] - m0[2][3];
+    m1[2][0] = mt[0] + m0[3][0];
+    m1[2][1] = mt[1] + m0[3][1];
+    m1[2][2] = mt[2] + m0[3][2];
+    m1[2][3] = mt[3] + m0[3][3];
+
+    mt[0] = m1[0][1] + m1[0][2];
+    mt[1] = m1[1][1] + m1[1][2];
+    mt[2] = m1[2][1] + m1[2][2];
+    m2[0][0] = mt[0] + m1[0][0];
+    m2[1][0] = mt[1] + m1[1][0];
+    m2[2][0] = mt[2] + m1[2][0];
+    m2[0][1] = m1[0][1] - m1[0][2];
+    m2[1][1] = m1[1][1] - m1[1][2];
+    m2[2][1] = m1[2][1] - m1[2][2];
+    m2[0][2] = mt[0] + m1[0][3];
+    m2[1][2] = mt[1] + m1[1][3];
+    m2[2][2] = mt[2] + m1[2][3];
+
+    outputs += (k * C + c) * 3 * 3;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            outputs[i * 3 + j] = m2[i][j];
         }
     }
 }
